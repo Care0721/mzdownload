@@ -1,0 +1,40 @@
+{
+  "email": {
+    "description": "萌宅账号（邮箱或用户名）",
+    "type": "string",
+    "hint": "用于登录获取下载权限的账号",
+    "obvious_hint": true,
+    "default": ""
+  },
+  "password": {
+    "description": "萌宅密码",
+    "type": "string",
+    "hint": "账号对应密码，请妥善保管",
+    "obvious_hint": true,
+    "default": ""
+  },
+  "admin_only": {
+    "description": "仅管理员可用",
+    "type": "bool",
+    "hint": "开启后只有管理员才能使用本插件指令",
+    "default": false
+  },
+  "cooldown_seconds": {
+    "description": "同一用户冷却时间（秒）",
+    "type": "int",
+    "hint": "同一用户两次成功调用之间的最小间隔，管理员不受限制。设为 0 表示不限制",
+    "default": 8
+  },
+  "list_limit": {
+    "description": "列表返回条数上限",
+    "type": "int",
+    "hint": "搜索/最新/热门列表最多显示多少条，建议 5～30",
+    "default": 10
+  },
+  "send_as_forward": {
+    "description": "下载结果使用合并转发",
+    "type": "bool",
+    "hint": "true 时下载结果用合并转发（聊天记录）发送，主要适配 OneBot v11；异常时自动回退为纯文本",
+    "default": false
+  }
+}
