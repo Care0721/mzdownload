@@ -3,6 +3,8 @@
 
 对接萌宅社区（mengzhai.club）HTTP API 的 AstrBot 插件，支持软件搜索、最新/热门列表、详情查看以及下载链接获取。
 
+- 点此https://mengzhai.club/下载萌宅社区软件获取账号密码
+
 ## 功能
 
 - `/mz搜索 <关键词>`：搜索软件
