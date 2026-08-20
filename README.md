@@ -1,4 +1,5 @@
-# astrbot_plugin_mengzhai
+# astrbot_plugin_mzdownload
+## 注意！ 此插件随时因萌宅社区版本更新而失效，仅供个人使用
 
 对接萌宅社区（mengzhai.club）HTTP API 的 AstrBot 插件，支持软件搜索、最新/热门列表、详情查看以及下载链接获取。
 
