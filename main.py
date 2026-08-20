@@ -18,7 +18,7 @@ UUID_RE = re.compile(
 @register(
     "astrbot_plugin_mzdownload",
     "Care",
-    "萌宅社区下载插件：搜索、最新/热门、详情、获取下载链接",
+    "萌宅下载插件：搜索、最新/热门、详情、获取下载链接",
     "1.9.6",
 )
 class MengzhaiPlugin(Star):
@@ -29,7 +29,7 @@ class MengzhaiPlugin(Star):
             base_url=BASE_URL,
             timeout=httpx.Timeout(20.0, connect=10.0),
             follow_redirects=True,
-            headers={"User-Agent": "AstrBot-MengzhaiPlugin/1.0.4"},
+            headers={"User-Agent": "AstrBot-MengzhaiPlugin/1.0.5"},
         )
         self._token: Optional[str] = None
         self._token_expires_at: float = 0.0
@@ -292,14 +292,65 @@ class MengzhaiPlugin(Star):
             n = 10
         return max(1, min(n, 50))
 
+    def _extract_keyword(self, event: AstrMessageEvent, keyword: str = "") -> str:
+        """优先用参数；为空则从完整消息里剥掉指令前缀，避免关键词丢失"""
+        kw = (keyword or "").strip()
+        if kw:
+            return kw
+
+        msg = (event.message_str or "").strip()
+        # 去掉可能的唤醒前缀 / 空格
+        msg = re.sub(r"^\s*/?\s*", "", msg)
+        for prefix in ("mz搜索", "mzsearch", "MZ搜索"):
+            if msg.lower().startswith(prefix.lower()):
+                msg = msg[len(prefix) :].strip()
+                break
+        # 再清一次前导斜杠
+        msg = re.sub(r"^/\s*", "", msg).strip()
+        return msg
+
+    def _extract_items(self, data: dict) -> list:
+        """兼容多种列表字段，并按 id 去重"""
+        if not isinstance(data, dict):
+            return []
+
+        candidates = [
+            data.get("items"),
+            data.get("list"),
+            data.get("data"),
+            data.get("results"),
+            data.get("softwares"),
+        ]
+        items = None
+        for c in candidates:
+            if isinstance(c, list):
+                items = c
+                break
+            if isinstance(c, dict):
+                for k in ("items", "list", "results", "records"):
+                    if isinstance(c.get(k), list):
+                        items = c.get(k)
+                        break
+            if items is not None:
+                break
+
+        if not isinstance(items, list):
+            return []
+
+        seen: set[str] = set()
+        unique: list = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            sid = str(it.get("id") or "").strip()
+            if sid:
+                if sid in seen:
+                    continue
+                seen.add(sid)
+            unique.append(it)
+        return unique
+
     def _match_score(self, item: dict, keyword: str) -> int:
-        """
-        匹配优先级（越大越靠前）：
-          3 = 标题含关键词
-          2 = 标签含关键词
-          1 = 简介/描述含关键词
-          0 = 其他
-        """
         if not isinstance(item, dict) or not keyword:
             return 0
 
@@ -342,9 +393,7 @@ class MengzhaiPlugin(Star):
 
         return 0
 
-    def _sort_search_items(self, items: Any, keyword: str) -> list:
-        if not isinstance(items, list):
-            return []
+    def _sort_search_items(self, items: list, keyword: str) -> list:
         indexed = list(enumerate(items))
         indexed.sort(
             key=lambda pair: (
@@ -443,7 +492,6 @@ class MengzhaiPlugin(Star):
         return str(url) if url else "", str(file_name), str(file_size), is_member
 
     def _build_result(self, event: AstrMessageEvent, text: str):
-        """根据配置返回纯文本或合并转发；失败时回退纯文本"""
         if not self._cfg("send_as_forward", False):
             return event.plain_result(text)
         try:
@@ -470,20 +518,29 @@ class MengzhaiPlugin(Star):
             yield event.plain_result(msg)
             return
 
-        keyword = (keyword or "").strip()
+        keyword = self._extract_keyword(event, keyword)
         if not keyword:
             yield event.plain_result("请输入关键词，例如：/mz搜索 爱情")
             return
 
         try:
+            # 同时带上几种常见参数名，避免接口参数名不一致
             data = await self._request(
                 "GET",
                 "/api/software",
-                params={"keyword": keyword},
+                params={
+                    "keyword": keyword,
+                    "q": keyword,
+                    "search": keyword,
+                    "query": keyword,
+                },
                 need_auth=self._should_auth(),
             )
-            items = data.get("items") if isinstance(data, dict) else []
+            items = self._extract_items(data)
             items = self._sort_search_items(items, keyword)
+            logger.info(
+                f"[萌宅] 搜索 keyword={keyword!r} 返回 {len(items)} 条（去重后）"
+            )
             text = self._format_list(items, f"搜索「{keyword}」", keyword=keyword)
             self._record_cooldown(event)
             yield self._build_result(event, text)
@@ -507,7 +564,7 @@ class MengzhaiPlugin(Star):
                 "/api/software/home/latest",
                 need_auth=self._should_auth(),
             )
-            items = data.get("items") if isinstance(data, dict) else []
+            items = self._extract_items(data)
             text = self._format_list(items, "最新软件")
             self._record_cooldown(event)
             yield self._build_result(event, text)
@@ -531,7 +588,7 @@ class MengzhaiPlugin(Star):
                 "/api/software/home/most-liked",
                 need_auth=self._should_auth(),
             )
-            items = data.get("items") if isinstance(data, dict) else []
+            items = self._extract_items(data)
             text = self._format_list(items, "热门软件")
             self._record_cooldown(event)
             yield self._build_result(event, text)
@@ -550,6 +607,11 @@ class MengzhaiPlugin(Star):
             return
 
         software_id = (software_id or "").strip()
+        if not software_id:
+            msg = (event.message_str or "").strip()
+            msg = re.sub(r"^\s*/?\s*mz详情\s*", "", msg, flags=re.I).strip()
+            software_id = msg
+
         if not self._is_valid_uuid(software_id):
             yield event.plain_result(
                 "请提供有效的软件 UUID，例如：\n/mz详情 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
@@ -607,6 +669,11 @@ class MengzhaiPlugin(Star):
             return
 
         software_id = (software_id or "").strip()
+        if not software_id:
+            msg = (event.message_str or "").strip()
+            msg = re.sub(r"^\s*/?\s*mz下载\s*", "", msg, flags=re.I).strip()
+            software_id = msg
+
         if not self._is_valid_uuid(software_id):
             yield event.plain_result(
                 "请提供有效的软件 UUID，例如：\n/mz下载 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
