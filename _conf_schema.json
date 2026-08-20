@@ -32,9 +32,9 @@
     "default": 10
   },
   "send_as_forward": {
-    "description": "下载结果使用合并转发",
+    "description": "结果使用合并转发",
     "type": "bool",
-    "hint": "true 时下载结果用合并转发（聊天记录）发送，主要适配 OneBot v11；异常时自动回退为纯文本",
+    "hint": "true 时搜索/最新/热门/详情/下载结果用合并转发（聊天记录）发送，主要适配 OneBot v11；异常时自动回退为纯文本",
     "default": false
   }
 }
