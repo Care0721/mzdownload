@@ -121,7 +121,7 @@ Base URL：https://cn-api.mengzhai.club
 
 ## 注意事项
 
-1. 请勿将账号密码写进代码或提交到公开仓库。
+1. 请勿将该插件用于官方群聊
 2. 下载接口有频率限制，请合理使用，避免触发限流。
 3. 合并转发主要适配 OneBot v11；其他平台建议保持 send_as_forward = false。
 4. 插件卸载/停用时会自动关闭 httpx.AsyncClient。
@@ -135,7 +135,7 @@ Base URL：https://cn-api.mengzhai.club
 
 ## 开发与规范
 
-本插件严格遵循 AstrBot 官方插件规范：
+本插件遵循 AstrBot 官方插件规范：
 
 - 模板：https://github.com/Soulter/helloworld
 - 开发文档：https://docs.astrbot.app/dev/star/plugin-new.html
@@ -146,4 +146,4 @@ Base URL：https://cn-api.mengzhai.club
 
 ## 许可证
 
-请遵循 AstrBot 及相关项目的开源协议。使用本插件获取的下载链接请遵守梦斋网站的服务条款与版权规定，仅供个人学习研究使用。
+请遵循 AstrBot 及相关项目的开源协议。使用本插件获取的下载链接请遵守萌宅网站的服务条款与版权规定，仅供个人学习研究使用。
