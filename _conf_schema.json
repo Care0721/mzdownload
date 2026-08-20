@@ -2,7 +2,7 @@
   "email": {
     "description": "萌宅账号（邮箱或用户名）",
     "type": "string",
-    "hint": "用于登录获取下载权限的账号",
+    "hint": "仅软件下载需要登录；小说接口不需要萌宅账号",
     "obvious_hint": true,
     "default": ""
   },
@@ -28,13 +28,19 @@
   "list_limit": {
     "description": "列表返回条数上限",
     "type": "int",
-    "hint": "搜索/最新/热门列表最多显示多少条，建议 5～30",
+    "hint": "搜索/最新/热门/小说列表最多显示多少条，建议 5～30",
     "default": 10
   },
   "send_as_forward": {
     "description": "结果使用合并转发",
     "type": "bool",
-    "hint": "true 时搜索/最新/热门/详情/下载结果用合并转发（聊天记录）发送，主要适配 OneBot v11；异常时自动回退为纯文本",
+    "hint": "true 时列表/详情/下载结果用合并转发发送（主要适配 OneBot v11），失败回退纯文本",
     "default": false
+  },
+  "novel_enabled": {
+    "description": "启用小说功能",
+    "type": "bool",
+    "hint": "关闭后 /mz小说* 指令不可用。小说来自第三方 Copy 接口，与萌宅账号无关",
+    "default": true
   }
 }
