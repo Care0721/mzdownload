@@ -19,7 +19,7 @@ UUID_RE = re.compile(
     "astrbot_plugin_mzdownload",
     "Care",
     "萌宅下载插件：搜索、最新/热门、详情、获取下载链接",
-    "1.8.0",
+    "1.9.0",
 )
 class MengzhaiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -29,17 +29,16 @@ class MengzhaiPlugin(Star):
             base_url=BASE_URL,
             timeout=httpx.Timeout(20.0, connect=10.0),
             follow_redirects=True,
-            headers={"User-Agent": "AstrBot-MengzhaiPlugin/1.0.1"},
+            headers={"User-Agent": "AstrBot-MengzhaiPlugin/1.0.2"},
         )
         self._token: Optional[str] = None
-        self._token_expires_at: float = 0.0  # 秒
+        self._token_expires_at: float = 0.0
         self._login_lock = asyncio.Lock()
-        self._cooldown: dict[str, float] = {}  # sender_id -> 下次可用时间戳
+        self._cooldown: dict[str, float] = {}
         self._last_email: str = ""
         self._last_password: str = ""
 
     async def terminate(self):
-        """插件卸载/停用时关闭 httpx 客户端"""
         try:
             await self.client.aclose()
         except Exception as e:
@@ -52,6 +51,11 @@ class MengzhaiPlugin(Star):
             return self.config.get(key, default)
         except Exception:
             return default
+
+    def _has_credentials(self) -> bool:
+        email = str(self._cfg("email", "") or "").strip()
+        password = str(self._cfg("password", "") or "")
+        return bool(email and password)
 
     def _check_admin_only(self, event: AstrMessageEvent) -> Optional[str]:
         if self._cfg("admin_only", False) and not event.is_admin():
@@ -118,7 +122,9 @@ class MengzhaiPlugin(Star):
             email = str(self._cfg("email", "") or "").strip()
             password = str(self._cfg("password", "") or "")
             if not email or not password:
-                raise RuntimeError("未配置萌宅账号或密码，请在 WebUI 插件配置中填写。")
+                raise RuntimeError(
+                    "未配置萌宅账号或密码，请在 WebUI → 插件配置中填写 email / password，并重载插件。"
+                )
 
             try:
                 resp = await self.client.post(
@@ -138,7 +144,7 @@ class MengzhaiPlugin(Star):
             if resp.status_code >= 400:
                 msg = ""
                 if isinstance(data, dict):
-                    msg = data.get("message") or data.get("msg") or str(data)
+                    msg = data.get("message") or data.get("msg") or data.get("error") or str(data)
                 raise RuntimeError(
                     f"登录失败 (HTTP {resp.status_code})"
                     + (f": {msg}" if msg else "")
@@ -147,7 +153,7 @@ class MengzhaiPlugin(Star):
             if not isinstance(data, dict) or not data.get("success"):
                 msg = ""
                 if isinstance(data, dict):
-                    msg = data.get("message") or data.get("msg") or str(data)
+                    msg = data.get("message") or data.get("msg") or data.get("error") or str(data)
                 else:
                     msg = str(data)
                 raise RuntimeError(f"登录失败: {msg or '未知错误'}")
@@ -206,12 +212,8 @@ class MengzhaiPlugin(Star):
         except Exception:
             data = None
 
-        # 401：清空 token 并重试一次（仅 need_auth 且允许重试时）
-        if (
-            need_auth
-            and _retry_auth
-            and resp.status_code == 401
-        ):
+        # 401：清空 token 并重试一次
+        if need_auth and _retry_auth and resp.status_code == 401:
             logger.warning("[萌宅] 收到 401，清空 token 并重试登录")
             self._clear_token()
             return await self._request(
@@ -224,19 +226,18 @@ class MengzhaiPlugin(Star):
             )
 
         if resp.status_code >= 400:
-            self._raise_api_error(resp.status_code, data, resp.text)
+            self._raise_api_error(resp.status_code, data, resp.text, need_auth=need_auth)
 
         if not isinstance(data, dict):
             raise RuntimeError("接口返回非 JSON 数据")
 
-        # 部分接口可能不带 success 字段，只要不是明确失败就接受
         if data.get("success") is False:
-            self._raise_api_error(resp.status_code, data, "")
+            self._raise_api_error(resp.status_code, data, "", need_auth=need_auth)
 
         return data
 
     def _raise_api_error(
-        self, status: int, data: Any, raw_text: str
+        self, status: int, data: Any, raw_text: str, *, need_auth: bool = False
     ) -> None:
         code = None
         msg = ""
@@ -245,6 +246,7 @@ class MengzhaiPlugin(Star):
             msg = (
                 data.get("message")
                 or data.get("msg")
+                or data.get("error")
                 or data.get("error_description")
                 or ""
             )
@@ -252,8 +254,20 @@ class MengzhaiPlugin(Star):
                 retry = data.get("retryAfterSec")
                 extra = f"，请 {retry} 秒后再试" if retry is not None else ""
                 raise RuntimeError(f"下载限流{extra}")
+
         if not msg:
-            msg = (raw_text or "")[:200] or "未知错误"
+            msg = (raw_text or "")[:300] or "未知错误"
+
+        # 针对 401 给出更明确提示
+        if status == 401:
+            if not need_auth and not self._has_credentials():
+                raise RuntimeError(
+                    "接口需要登录，但未配置账号密码。请在 WebUI 填写 email/password 后重载插件。"
+                )
+            raise RuntimeError(
+                f"未授权 (401)：{msg}。请检查账号密码是否正确，或重新保存配置后重载插件。"
+            )
+
         raise RuntimeError(f"接口错误 (HTTP {status}): {msg}")
 
     # ------------------------- 工具方法 -------------------------
@@ -295,7 +309,6 @@ class MengzhaiPlugin(Star):
         return "\n".join(lines)
 
     def _extract_download_info(self, data: dict) -> tuple[str, str, str, Any]:
-        """兼容多种可能的返回结构，返回 (url, file_name, file_size, is_member)"""
         nested = data.get("data") if isinstance(data.get("data"), dict) else {}
         sources = [data, nested]
 
@@ -314,23 +327,20 @@ class MengzhaiPlugin(Star):
         return str(url) if url else "", str(file_name), str(file_size), is_member
 
     def _build_result(self, event: AstrMessageEvent, text: str):
-        """根据配置返回 plain 或合并转发结果；失败时回退 plain"""
         if not self._cfg("send_as_forward", False):
             return event.plain_result(text)
-
         try:
             self_id = event.get_self_id()
-            # Node.uin 官方类型为 str | None，也兼容 int
             uin: Any = str(self_id) if self_id is not None else "0"
-            node = Node(
-                uin=uin,
-                name="萌宅下载",
-                content=[Plain(text)],
-            )
+            node = Node(uin=uin, name="萌宅下载", content=[Plain(text)])
             return event.chain_result([node])
         except Exception as e:
             logger.warning(f"[萌宅] 合并转发构建失败，回退纯文本: {e}")
             return event.plain_result(text)
+
+    def _should_auth(self) -> bool:
+        """有配置账号时，所有接口都带 Token（搜索等也可能需要登录）"""
+        return self._has_credentials()
 
     # ------------------------- 指令 -------------------------
 
@@ -351,7 +361,10 @@ class MengzhaiPlugin(Star):
 
         try:
             data = await self._request(
-                "GET", "/api/software", params={"keyword": keyword}
+                "GET",
+                "/api/software",
+                params={"keyword": keyword},
+                need_auth=self._should_auth(),
             )
             items = data.get("items") if isinstance(data, dict) else []
             text = self._format_list(items, f"搜索「{keyword}」")
@@ -372,7 +385,11 @@ class MengzhaiPlugin(Star):
             return
 
         try:
-            data = await self._request("GET", "/api/software/home/latest")
+            data = await self._request(
+                "GET",
+                "/api/software/home/latest",
+                need_auth=self._should_auth(),
+            )
             items = data.get("items") if isinstance(data, dict) else []
             text = self._format_list(items, "最新软件")
             self._record_cooldown(event)
@@ -392,7 +409,11 @@ class MengzhaiPlugin(Star):
             return
 
         try:
-            data = await self._request("GET", "/api/software/home/most-liked")
+            data = await self._request(
+                "GET",
+                "/api/software/home/most-liked",
+                need_auth=self._should_auth(),
+            )
             items = data.get("items") if isinstance(data, dict) else []
             text = self._format_list(items, "热门软件")
             self._record_cooldown(event)
@@ -419,7 +440,11 @@ class MengzhaiPlugin(Star):
             return
 
         try:
-            data = await self._request("GET", f"/api/software/{software_id}")
+            data = await self._request(
+                "GET",
+                f"/api/software/{software_id}",
+                need_auth=self._should_auth(),
+            )
             item = data.get("item") if isinstance(data.get("item"), dict) else data
             if not isinstance(item, dict):
                 item = {}
