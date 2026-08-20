@@ -18,8 +18,8 @@ UUID_RE = re.compile(
 @register(
     "astrbot_plugin_mzdownload",
     "Care",
-    "萌宅下载插件：搜索、最新/热门、详情、获取下载链接",
-    "1.9.0",
+    "萌宅社区下载插件：搜索、最新/热门、详情、获取下载链接",
+    "1.9.6",
 )
 class MengzhaiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -29,7 +29,7 @@ class MengzhaiPlugin(Star):
             base_url=BASE_URL,
             timeout=httpx.Timeout(20.0, connect=10.0),
             follow_redirects=True,
-            headers={"User-Agent": "AstrBot-MengzhaiPlugin/1.0.2"},
+            headers={"User-Agent": "AstrBot-MengzhaiPlugin/1.0.4"},
         )
         self._token: Optional[str] = None
         self._token_expires_at: float = 0.0
@@ -144,7 +144,12 @@ class MengzhaiPlugin(Star):
             if resp.status_code >= 400:
                 msg = ""
                 if isinstance(data, dict):
-                    msg = data.get("message") or data.get("msg") or data.get("error") or str(data)
+                    msg = (
+                        data.get("message")
+                        or data.get("msg")
+                        or data.get("error")
+                        or str(data)
+                    )
                 raise RuntimeError(
                     f"登录失败 (HTTP {resp.status_code})"
                     + (f": {msg}" if msg else "")
@@ -153,7 +158,12 @@ class MengzhaiPlugin(Star):
             if not isinstance(data, dict) or not data.get("success"):
                 msg = ""
                 if isinstance(data, dict):
-                    msg = data.get("message") or data.get("msg") or data.get("error") or str(data)
+                    msg = (
+                        data.get("message")
+                        or data.get("msg")
+                        or data.get("error")
+                        or str(data)
+                    )
                 else:
                     msg = str(data)
                 raise RuntimeError(f"登录失败: {msg or '未知错误'}")
@@ -212,7 +222,6 @@ class MengzhaiPlugin(Star):
         except Exception:
             data = None
 
-        # 401：清空 token 并重试一次
         if need_auth and _retry_auth and resp.status_code == 401:
             logger.warning("[萌宅] 收到 401，清空 token 并重试登录")
             self._clear_token()
@@ -226,7 +235,9 @@ class MengzhaiPlugin(Star):
             )
 
         if resp.status_code >= 400:
-            self._raise_api_error(resp.status_code, data, resp.text, need_auth=need_auth)
+            self._raise_api_error(
+                resp.status_code, data, resp.text, need_auth=need_auth
+            )
 
         if not isinstance(data, dict):
             raise RuntimeError("接口返回非 JSON 数据")
@@ -258,7 +269,6 @@ class MengzhaiPlugin(Star):
         if not msg:
             msg = (raw_text or "")[:300] or "未知错误"
 
-        # 针对 401 给出更明确提示
         if status == 401:
             if not need_auth and not self._has_credentials():
                 raise RuntimeError(
@@ -282,7 +292,71 @@ class MengzhaiPlugin(Star):
             n = 10
         return max(1, min(n, 50))
 
-    def _format_list(self, items: Any, title: str) -> str:
+    def _match_score(self, item: dict, keyword: str) -> int:
+        """
+        匹配优先级（越大越靠前）：
+          3 = 标题含关键词
+          2 = 标签含关键词
+          1 = 简介/描述含关键词
+          0 = 其他
+        """
+        if not isinstance(item, dict) or not keyword:
+            return 0
+
+        kw = keyword.strip().lower()
+        if not kw:
+            return 0
+
+        def contains(text: Any) -> bool:
+            if text is None:
+                return False
+            if isinstance(text, (list, tuple, set)):
+                return any(contains(x) for x in text)
+            return kw in str(text).lower()
+
+        title = item.get("title") or item.get("name") or ""
+        if contains(title):
+            return 3
+
+        tags = (
+            item.get("tags")
+            or item.get("tag")
+            or item.get("labels")
+            or item.get("categories")
+            or item.get("category")
+            or []
+        )
+        if contains(tags):
+            return 2
+
+        desc = (
+            item.get("description")
+            or item.get("desc")
+            or item.get("summary")
+            or item.get("intro")
+            or item.get("content")
+            or ""
+        )
+        if contains(desc):
+            return 1
+
+        return 0
+
+    def _sort_search_items(self, items: Any, keyword: str) -> list:
+        if not isinstance(items, list):
+            return []
+        indexed = list(enumerate(items))
+        indexed.sort(
+            key=lambda pair: (
+                -self._match_score(
+                    pair[1] if isinstance(pair[1], dict) else {}, keyword
+                ),
+                pair[0],
+            )
+        )
+        return [it for _, it in indexed]
+
+    def _format_list(self, items: Any, title: str, keyword: str = "") -> str:
         if not isinstance(items, list):
             items = []
         limit = self._list_limit()
@@ -291,11 +365,13 @@ class MengzhaiPlugin(Star):
         if not items:
             return f"【{title}】\n暂无数据"
 
-        lines = [f"【{title}】共 {len(items)} 条：\n"]
+        lines = [f"【{title}】共 {len(items)} 条", ""]
         for i, it in enumerate(items, 1):
             if not isinstance(it, dict):
                 lines.append(f"{i}. （无效条目）")
+                lines.append("")
                 continue
+
             sid = it.get("id") or "未知ID"
             name = it.get("title") or it.get("name") or "未知标题"
             size = (
@@ -304,8 +380,48 @@ class MengzhaiPlugin(Star):
                 or it.get("size")
                 or "未知大小"
             )
-            lines.append(f"{i}. {name}\n   ID: {sid}\n   大小: {size}")
-        lines.append("\n使用 /mz下载 <软件ID> 获取下载链接")
+
+            mark = ""
+            if keyword:
+                score = self._match_score(it, keyword)
+                if score == 3:
+                    mark = " 【标题匹配】"
+                elif score == 2:
+                    mark = " 【标签匹配】"
+                elif score == 1:
+                    mark = " 【简介匹配】"
+
+            lines.append(f"{i}. {name}{mark}")
+            lines.append(f"   ID：{sid}")
+            lines.append(f"   大小：{size}")
+            lines.append("")
+
+        lines.append("使用 /mz下载 <软件ID> 获取下载链接")
+        return "\n".join(lines).rstrip()
+
+    def _format_download(
+        self,
+        *,
+        software_id: str,
+        url: str,
+        file_name: str,
+        file_size: str,
+        is_member: Any,
+    ) -> str:
+        lines = [
+            "【萌宅 · 下载准备成功】",
+            "────────────────",
+            f"软件 ID：{software_id}",
+            f"文件名：{file_name}",
+            f"大小：{file_size}",
+        ]
+        if is_member is not None:
+            lines.append(f"会员资源：{'是' if is_member else '否'}")
+        lines.append("────────────────")
+        lines.append("下载链接：")
+        lines.append(url)
+        lines.append("────────────────")
+        lines.append("提示：链接可能有有效期，请尽快下载。")
         return "\n".join(lines)
 
     def _extract_download_info(self, data: dict) -> tuple[str, str, str, Any]:
@@ -327,6 +443,7 @@ class MengzhaiPlugin(Star):
         return str(url) if url else "", str(file_name), str(file_size), is_member
 
     def _build_result(self, event: AstrMessageEvent, text: str):
+        """根据配置返回纯文本或合并转发；失败时回退纯文本"""
         if not self._cfg("send_as_forward", False):
             return event.plain_result(text)
         try:
@@ -339,7 +456,6 @@ class MengzhaiPlugin(Star):
             return event.plain_result(text)
 
     def _should_auth(self) -> bool:
-        """有配置账号时，所有接口都带 Token（搜索等也可能需要登录）"""
         return self._has_credentials()
 
     # ------------------------- 指令 -------------------------
@@ -356,7 +472,7 @@ class MengzhaiPlugin(Star):
 
         keyword = (keyword or "").strip()
         if not keyword:
-            yield event.plain_result("请输入关键词，例如：/mz搜索 Photoshop")
+            yield event.plain_result("请输入关键词，例如：/mz搜索 爱情")
             return
 
         try:
@@ -367,9 +483,10 @@ class MengzhaiPlugin(Star):
                 need_auth=self._should_auth(),
             )
             items = data.get("items") if isinstance(data, dict) else []
-            text = self._format_list(items, f"搜索「{keyword}」")
+            items = self._sort_search_items(items, keyword)
+            text = self._format_list(items, f"搜索「{keyword}」", keyword=keyword)
             self._record_cooldown(event)
-            yield event.plain_result(text)
+            yield self._build_result(event, text)
         except Exception as e:
             logger.exception("[萌宅] 搜索失败")
             yield event.plain_result(f"搜索失败：{e}")
@@ -393,7 +510,7 @@ class MengzhaiPlugin(Star):
             items = data.get("items") if isinstance(data, dict) else []
             text = self._format_list(items, "最新软件")
             self._record_cooldown(event)
-            yield event.plain_result(text)
+            yield self._build_result(event, text)
         except Exception as e:
             logger.exception("[萌宅] 获取最新列表失败")
             yield event.plain_result(f"获取最新列表失败：{e}")
@@ -417,7 +534,7 @@ class MengzhaiPlugin(Star):
             items = data.get("items") if isinstance(data, dict) else []
             text = self._format_list(items, "热门软件")
             self._record_cooldown(event)
-            yield event.plain_result(text)
+            yield self._build_result(event, text)
         except Exception as e:
             logger.exception("[萌宅] 获取热门列表失败")
             yield event.plain_result(f"获取热门列表失败：{e}")
@@ -474,7 +591,7 @@ class MengzhaiPlugin(Star):
                 f"使用 /mz下载 {software_id} 获取下载链接"
             )
             self._record_cooldown(event)
-            yield event.plain_result(text)
+            yield self._build_result(event, text)
         except Exception as e:
             logger.exception("[萌宅] 获取详情失败")
             yield event.plain_result(f"获取详情失败：{e}")
@@ -511,16 +628,13 @@ class MengzhaiPlugin(Star):
                 )
                 return
 
-            lines = [
-                "【下载准备成功】",
-                f"文件名：{file_name}",
-                f"大小：{file_size}",
-            ]
-            if is_member is not None:
-                lines.append(f"会员资源：{'是' if is_member else '否'}")
-            lines.append(f"下载链接：\n{url}")
-
-            text = "\n".join(lines)
+            text = self._format_download(
+                software_id=software_id,
+                url=url,
+                file_name=file_name,
+                file_size=file_size,
+                is_member=is_member,
+            )
             self._record_cooldown(event)
             yield self._build_result(event, text)
         except Exception as e:
