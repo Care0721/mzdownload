@@ -1,7 +1,15 @@
 """
-AstrBot 插件：萌宅下载 (astrbot_plugin_mengzhai)
-对接 https://cn-api.mengzhai.club ，含 X-App 正版签名校验。
-合并转发失败时自动回退纯文本。
+AstrBot 插件：萌宅下载 (astrbot_plugin_mengzhai) —— 签名待补全版
+
+【使用提示】
+1. WebUI 填写 email / password（搜索、下载需要登录）。
+2. 当前 _build_app_headers() 未实现正版 X-App 签名，请求会返回 403
+   （缺少 X-App 签名头 / APP_ATTESTATION_FAILED）。
+3. 请自行逆向正版 APK（libmz_guard.so 的 mzAttestationAuth）或对照抓包，
+   补全签名逻辑后再使用。
+4. 可从 GET /api/app/status 的 attestation 获取 signSecret / pkg / ver。
+5. 指令：/mz搜索 /mz最新 /mz热门 /mz详情 /mz下载
+6. 合并转发失败时会自动回退纯文本；协议端仍发不出时请关闭 send_as_forward。
 """
 
 from __future__ import annotations
@@ -27,8 +35,6 @@ except ImportError:
     AstrBotConfig = dict  # type: ignore
 
 BASE_URL = "https://cn-api.mengzhai.club"
-# 正版 APK 签名证书 SHA256（大写）
-APK_CERT_SHA256 = "D59D09F24E275F5F2050AAAEEF29590359CA220BB9F8F7CDBF74A65102375192"
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
@@ -39,8 +45,8 @@ HTTP_TIMEOUT = 20.0
 @register(
     "astrbot_plugin_mengzhai",
     "grok",
-    "萌宅下载：搜索/最新/热门/详情/下载",
-    "1.1.1",
+    "萌宅下载：搜索/最新/热门/详情/下载（签名待补全）",
+    "1.1.1-unsigned",
 )
 class MengzhaiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
@@ -143,6 +149,7 @@ class MengzhaiPlugin(Star):
             self._cooldown[sid] = time.time()
 
     async def _refresh_attestation(self, force: bool = False) -> None:
+        """拉取 /api/app/status 中的 signSecret / pkg / ver（供你自行签名时使用）。"""
         now = time.time()
         if not force and self._att_secret and (now - self._att_fetched_at) < 300:
             return
@@ -168,50 +175,53 @@ class MengzhaiPlugin(Star):
             self._att_ver = str(att.get("ver") or "1").strip() or "1"
             self._att_fetched_at = time.time()
             logger.info(
-                f"[mengzhai] attestation refreshed pkg={self._att_pkg} ver={self._att_ver}"
+                f"[mengzhai] attestation meta pkg={self._att_pkg} ver={self._att_ver}"
             )
 
     def _build_app_headers(self, method: str, path: str) -> dict[str, str]:
         """
-        与官方 libmz_guard.so mzAttestationAuth 一致:
-          message = pkg \\n sig \\n ver \\n ts \\n nonce \\n METHOD \\n path
-          auth = HMAC-SHA256(signSecret, message).hexdigest()  # 小写
-        path 不含 query。
+        TODO: 自行实现 X-App 签名，否则接口会 403。
+
+        需要自行完成：
+        - APK 证书 SHA256（X-App-Sig）
+        - 拼串顺序与分隔符
+        - HMAC-SHA256(key=signSecret, msg=...) 或你逆向得到的算法
+        - ts / nonce 生成规则
+
+        可用字段（_refresh_attestation 已写入）：
+          self._att_secret  ← attestation.signSecret
+          self._att_pkg     ← attestation.pkg
+          self._att_ver     ← attestation.ver
+
+        path 签名时一般不要带 ?query。
         """
-        if not self._att_secret:
-            return {"User-Agent": f"{self._att_pkg}/3.62", "Accept": "application/json"}
-        ts = str(int(time.time()))
-        nonce = uuid.uuid4().hex
-        method_u = (method or "GET").upper()
-        pure_path = path.split("?", 1)[0] or "/"
-        if not pure_path.startswith("/"):
-            pure_path = "/" + pure_path
-        msg = "\n".join(
-            [
-                self._att_pkg,
-                APK_CERT_SHA256,
-                self._att_ver,
-                ts,
-                nonce,
-                method_u,
-                pure_path,
-            ]
-        )
-        auth = hmac.new(
-            self._att_secret.encode("utf-8"),
-            msg.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        return {
-            "X-App-Pkg": self._att_pkg,
-            "X-App-Sig": APK_CERT_SHA256,
-            "X-App-Ver": self._att_ver,
-            "X-App-Ts": ts,
-            "X-App-Nonce": nonce,
-            "X-App-Auth": auth,
+        headers = {
             "User-Agent": f"{self._att_pkg}/3.62",
             "Accept": "application/json",
         }
+        # ---- 签名占位：请自行实现后取消注释并改正确 ----
+        # if self._att_secret:
+        #     ts = str(int(time.time()))
+        #     nonce = uuid.uuid4().hex
+        #     pure_path = path.split("?", 1)[0] or "/"
+        #     if not pure_path.startswith("/"):
+        #         pure_path = "/" + pure_path
+        #     method_u = (method or "GET").upper()
+        #     # msg = "??? 你自己按逆向结果拼接 ???"
+        #     # auth = hmac.new(
+        #     #     self._att_secret.encode("utf-8"),
+        #     #     msg.encode("utf-8"),
+        #     #     hashlib.sha256,
+        #     # ).hexdigest()
+        #     # headers.update({
+        #     #     "X-App-Pkg": self._att_pkg,
+        #     #     "X-App-Sig": "???证书SHA256大写???",
+        #     #     "X-App-Ver": self._att_ver,
+        #     #     "X-App-Ts": ts,
+        #     #     "X-App-Nonce": nonce,
+        #     #     "X-App-Auth": auth,
+        #     # })
+        return headers
 
     def _token_valid(self) -> bool:
         if not self._token:
@@ -336,7 +346,9 @@ class MengzhaiPlugin(Star):
             if code == "APP_ATTESTATION_FAILED":
                 self._att_secret = ""
                 self._att_fetched_at = 0
-                raise RuntimeError(f"应用完整性校验失败，请稍后重试: {err}")
+                raise RuntimeError(
+                    f"应用完整性校验失败（请先实现 _build_app_headers 签名）: {err}"
+                )
             raise RuntimeError(f"拒绝访问 (HTTP 403): {err}")
 
         if isinstance(data, dict) and data.get("success") is False:
@@ -535,7 +547,6 @@ class MengzhaiPlugin(Star):
             except ValueError:
                 uin = uin_raw
 
-            # 过长拆多节点，降低 NapCat 超时概率
             max_len = 3500
             chunks = [text[i : i + max_len] for i in range(0, len(text), max_len)] or [
                 text
