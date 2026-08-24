@@ -1,6 +1,12 @@
 """
-AstrBot 插件：萌宅下载
-带 X-App 签名；纯文本优先直发，避免 Reply+At 导致 NapCat 超时。
+AstrBot 插件：萌宅下载 —— 签名待补全版
+
+【说明】
+1. WebUI 填写 email / password（搜索、下载需要登录）。
+2. _build_app_headers() 未实现正版 X-App 签名，会 403，需自行逆向补全。
+3. 可从 GET /api/app/status → attestation 取 signSecret / pkg / ver。
+4. 纯文本优先 OneBot 直发，减轻 Reply+At 导致的 NapCat 超时。
+5. 建议关闭 send_as_forward，list_limit=5，并关闭「引用回复 / @发送者」。
 """
 
 from __future__ import annotations
@@ -26,7 +32,6 @@ except ImportError:
     AstrBotConfig = dict  # type: ignore
 
 BASE_URL = "https://cn-api.mengzhai.club"
-APK_CERT_SHA256 = "D59D09F24E275F5F2050AAAEEF29590359CA220BB9F8F7CDBF74A65102375192"
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
@@ -38,8 +43,8 @@ PLAIN_CHUNK_SIZE = 500
 @register(
     "astrbot_plugin_mengzhai",
     "grok",
-    "萌宅下载：搜索/最新/热门/详情/下载",
-    "1.1.3",
+    "萌宅下载：搜索/最新/热门/详情/下载（签名待补全）",
+    "1.1.3-unsigned",
 )
 class MengzhaiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
@@ -142,6 +147,7 @@ class MengzhaiPlugin(Star):
             self._cooldown[sid] = time.time()
 
     async def _refresh_attestation(self, force: bool = False) -> None:
+        """拉取 signSecret / pkg / ver，供你自行实现签名时使用。"""
         now = time.time()
         if not force and self._att_secret and (now - self._att_fetched_at) < 300:
             return
@@ -167,44 +173,46 @@ class MengzhaiPlugin(Star):
             self._att_ver = str(att.get("ver") or "1").strip() or "1"
             self._att_fetched_at = time.time()
             logger.info(
-                f"[mengzhai] attestation refreshed pkg={self._att_pkg} ver={self._att_ver}"
+                f"[mengzhai] attestation meta pkg={self._att_pkg} ver={self._att_ver}"
             )
 
     def _build_app_headers(self, method: str, path: str) -> dict[str, str]:
-        if not self._att_secret:
-            return {"User-Agent": f"{self._att_pkg}/3.62", "Accept": "application/json"}
-        ts = str(int(time.time()))
-        nonce = uuid.uuid4().hex
-        method_u = (method or "GET").upper()
-        pure_path = path.split("?", 1)[0] or "/"
-        if not pure_path.startswith("/"):
-            pure_path = "/" + pure_path
-        msg = "\n".join(
-            [
-                self._att_pkg,
-                APK_CERT_SHA256,
-                self._att_ver,
-                ts,
-                nonce,
-                method_u,
-                pure_path,
-            ]
-        )
-        auth = hmac.new(
-            self._att_secret.encode("utf-8"),
-            msg.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        return {
-            "X-App-Pkg": self._att_pkg,
-            "X-App-Sig": APK_CERT_SHA256,
-            "X-App-Ver": self._att_ver,
-            "X-App-Ts": ts,
-            "X-App-Nonce": nonce,
-            "X-App-Auth": auth,
+        """
+        TODO: 自行实现 X-App 签名，否则接口会 403。
+
+        可用：
+          self._att_secret / self._att_pkg / self._att_ver
+        需要自行补：
+          证书 SHA256、拼串顺序、HMAC 等（逆向 libmz_guard.so 或抓包）
+        path 签名时一般不要带 ?query。
+        """
+        headers = {
             "User-Agent": f"{self._att_pkg}/3.62",
             "Accept": "application/json",
         }
+        # ---- 签名占位：自行实现后取消注释并改正确 ----
+        # if self._att_secret:
+        #     ts = str(int(time.time()))
+        #     nonce = uuid.uuid4().hex
+        #     pure_path = path.split("?", 1)[0] or "/"
+        #     if not pure_path.startswith("/"):
+        #         pure_path = "/" + pure_path
+        #     method_u = (method or "GET").upper()
+        #     # msg = "??? 你自己按逆向结果拼接 ???"
+        #     # auth = hmac.new(
+        #     #     self._att_secret.encode("utf-8"),
+        #     #     msg.encode("utf-8"),
+        #     #     hashlib.sha256,
+        #     # ).hexdigest()
+        #     # headers.update({
+        #     #     "X-App-Pkg": self._att_pkg,
+        #     #     "X-App-Sig": "???证书SHA256大写???",
+        #     #     "X-App-Ver": self._att_ver,
+        #     #     "X-App-Ts": ts,
+        #     #     "X-App-Nonce": nonce,
+        #     #     "X-App-Auth": auth,
+        #     # })
+        return headers
 
     def _token_valid(self) -> bool:
         if not self._token:
@@ -326,6 +334,9 @@ class MengzhaiPlugin(Star):
             if code == "APP_ATTESTATION_FAILED":
                 self._att_secret = ""
                 self._att_fetched_at = 0
+                raise RuntimeError(
+                    f"完整性校验失败（请先实现 _build_app_headers）: {data.get('error') or data}"
+                )
             raise RuntimeError(f"拒绝访问 (HTTP 403): {data.get('error') or data}")
         if isinstance(data, dict) and data.get("success") is False:
             code = data.get("code") or ""
@@ -465,10 +476,7 @@ class MengzhaiPlugin(Star):
         return chunks
 
     async def _send_raw_plain(self, event: AstrMessageEvent, text: str) -> bool:
-        """
-        尽量用 OneBot API 直发纯文本，绕过 AstrBot 自动加的 Reply/At，
-        减轻 NapCat sendMsg 超时。
-        """
+        """OneBot 直发纯文本，尽量不带 Reply/At。"""
         text = (text or "").strip()
         if not text:
             return False
@@ -502,12 +510,10 @@ class MengzhaiPlugin(Star):
             return False
 
     async def _deliver(self, event: AstrMessageEvent, text: str) -> AsyncGenerator:
-        """优先直发；失败再走 yield（可能被加 Reply/At）。"""
         text = (text or "").strip()
         if not text:
             return
 
-        # 合并转发（可选）
         if self._send_as_forward():
             try:
                 uin_raw = str(event.get_self_id() or "").strip()
@@ -530,9 +536,7 @@ class MengzhaiPlugin(Star):
             except Exception as e:
                 logger.warning(f"[mengzhai] forward failed: {e}")
 
-        # 直发纯文本（无 Reply/At）
         if await self._send_raw_plain(event, text):
-            # 阻止后续管道再发一遍（若当前版本支持）
             try:
                 if hasattr(event, "stop_event"):
                     event.stop_event()
@@ -540,12 +544,10 @@ class MengzhaiPlugin(Star):
                 pass
             return
 
-        # 回退：普通 yield
-        for i, chunk in enumerate(self._split_text(text, PLAIN_CHUNK_SIZE)):
-            if i == 0 and len(self._split_text(text, PLAIN_CHUNK_SIZE)) > 1:
-                yield event.plain_result(f"(1/{len(self._split_text(text, PLAIN_CHUNK_SIZE))})\n{chunk}")
-            elif len(self._split_text(text, PLAIN_CHUNK_SIZE)) > 1:
-                n = len(self._split_text(text, PLAIN_CHUNK_SIZE))
+        parts = self._split_text(text, PLAIN_CHUNK_SIZE)
+        n = len(parts)
+        for i, chunk in enumerate(parts):
+            if n > 1:
                 yield event.plain_result(f"({i + 1}/{n})\n{chunk}")
             else:
                 yield event.plain_result(chunk)
