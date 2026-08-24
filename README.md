@@ -5,6 +5,28 @@
 
 - 点此链接`https://mengzhai.club`下载萌宅社区软件获取账号密码
 
+【萌宅插件 · 签名自补】
+
+本插件框架已写好：登录、搜索、最新、热门、详情、下载、冷却、合并转发等。
+当前缺少「正版 X-App 签名」，直接请求会 403：缺少 X-App 签名头 / APP_ATTESTATION_FAILED。
+
+你需要自己补全 main.py 里的 _build_app_headers()：
+
+1. 从 GET https://cn-api.mengzhai.club/api/app/status 读取
+   attestation.signSecret / pkg / ver
+
+2. 每次请求生成头：
+   X-App-Pkg / X-App-Sig / X-App-Ver / X-App-Ts / X-App-Nonce / X-App-Auth
+
+3. X-App-Auth 一般为 HMAC-SHA256，密钥为 signSecret；
+   明文通常由 pkg、证书指纹、ver、时间戳、nonce、METHOD、path 等按固定顺序拼接
+   （具体顺序与证书指纹需自行逆向正版 APK 的 libmz_guard.so 或抓包对照）
+
+4. path 签名时不要带 ?query
+5. 搜索、下载需要 WebUI 配置 email/password，并带 Authorization: Bearer <token>
+
+补全后先测：/mz最新 应返回列表；再测登录与 /mz搜索。
+
 ## 功能
 
 - `/mz搜索 <关键词>`：搜索软件
