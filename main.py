@@ -1,987 +1,696 @@
+"""
+AstrBot 插件：萌宅下载 (astrbot_plugin_mengzhai)
+对接 https://cn-api.mengzhai.club ，含 X-App 正版签名校验。
+"""
+
+from __future__ import annotations
+
 import asyncio
+import hashlib
+import hmac
 import re
 import time
-from typing import Any, Optional
+import uuid
+from typing import Any, AsyncGenerator, Optional
 
 import httpx
-from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Node, Plain
-from astrbot.api.star import Context, Star, register
 
-MZ_BASE = "https://cn-api.mengzhai.club"
-COPY_BASES = [
-    "https://api.copy202602.com",
-    "https://api.copy202601.com",
-]
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star, register
+from astrbot.api.message_components import Node, Plain
+
+try:
+    from astrbot.api import AstrBotConfig
+except ImportError:
+    AstrBotConfig = dict  # type: ignore
+
+BASE_URL = "https://cn-api.mengzhai.club"
+# 正版 APK 签名证书 SHA256（大写）
+APK_CERT_SHA256 = "D59D09F24E275F5F2050AAAEEF29590359CA220BB9F8F7CDBF74A65102375192"
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
-PATH_WORD_RE = re.compile(r"^[a-zA-Z0-9_-]{1,80}$")
+TOKEN_REFRESH_AHEAD_SEC = 60
+HTTP_TIMEOUT = 20.0
 
 
 @register(
-    "astrbot_plugin_mzdownload",
-    "YourName",
-    "萌宅下载 + Copy 小说搜索/详情/分卷",
-    "2.0.0",
+    "astrbot_plugin_mengzhai",
+    "grok",
+    "萌宅下载：搜索/最新/热门/详情/下载",
+    "1.1.0",
 )
 class MengzhaiPlugin(Star):
-    def __init__(self, context: Context, config: AstrBotConfig):
+    def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
-        self.config = config
-        self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(20.0, connect=10.0),
-            follow_redirects=True,
-            headers={"User-Agent": "AstrBot-MengzhaiPlugin/1.1.0"},
-        )
-        self._token: Optional[str] = None
-        self._token_expires_at: float = 0.0
-        self._login_lock = asyncio.Lock()
+        self.config = config or {}
+        self._client: Optional[httpx.AsyncClient] = None
+
+        self._token: str = ""
+        self._token_expire_ms: int = 0
+        self._token_lock = asyncio.Lock()
+        self._last_login_email: str = ""
+        self._last_login_password: str = ""
+
+        self._att_secret: str = ""
+        self._att_pkg: str = "com.mz.game"
+        self._att_ver: str = "1"
+        self._att_lock = asyncio.Lock()
+        self._att_fetched_at: float = 0.0
+
         self._cooldown: dict[str, float] = {}
-        self._last_email: str = ""
-        self._last_password: str = ""
-
-    async def terminate(self):
-        try:
-            await self.client.aclose()
-        except Exception as e:
-            logger.warning(f"[萌宅] 关闭 httpx 客户端异常: {e}")
-
-    # ------------------------- 配置 / 权限 / 冷却 -------------------------
 
     def _cfg(self, key: str, default: Any = None) -> Any:
         try:
-            return self.config.get(key, default)
+            if self.config is None:
+                return default
+            if isinstance(self.config, dict):
+                return self.config.get(key, default)
+            return getattr(self.config, key, default)
         except Exception:
             return default
 
-    def _has_credentials(self) -> bool:
-        email = str(self._cfg("email", "") or "").strip()
-        password = str(self._cfg("password", "") or "")
-        return bool(email and password)
+    def _email(self) -> str:
+        return str(self._cfg("email", "") or "").strip()
 
-    def _check_admin_only(self, event: AstrMessageEvent) -> Optional[str]:
-        if self._cfg("admin_only", False) and not event.is_admin():
-            return "本插件已开启「仅管理员可用」，你没有权限。"
+    def _password(self) -> str:
+        return str(self._cfg("password", "") or "").strip()
+
+    def _admin_only(self) -> bool:
+        return bool(self._cfg("admin_only", False))
+
+    def _cooldown_sec(self) -> int:
+        try:
+            return max(0, int(self._cfg("cooldown_seconds", 8) or 0))
+        except Exception:
+            return 8
+
+    def _list_limit(self) -> int:
+        try:
+            n = int(self._cfg("list_limit", 10) or 10)
+            return max(1, min(30, n))
+        except Exception:
+            return 10
+
+    def _send_as_forward(self) -> bool:
+        return bool(self._cfg("send_as_forward", False))
+
+    def _has_credentials(self) -> bool:
+        return bool(self._email() and self._password())
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                base_url=BASE_URL,
+                timeout=HTTP_TIMEOUT,
+                headers={"Accept": "application/json"},
+                follow_redirects=True,
+            )
+        return self._client
+
+    async def terminate(self):
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+        self._client = None
+
+    def _check_admin(self, event: AstrMessageEvent) -> Optional[str]:
+        if self._admin_only() and not event.is_admin():
+            return "本插件仅管理员可用。"
         return None
 
     def _check_cooldown(self, event: AstrMessageEvent) -> Optional[str]:
         if event.is_admin():
             return None
-        try:
-            cd = int(self._cfg("cooldown_seconds", 8) or 0)
-        except (TypeError, ValueError):
-            cd = 8
-        if cd <= 0:
+        sec = self._cooldown_sec()
+        if sec <= 0:
             return None
-        uid = str(event.get_sender_id() or "")
-        if not uid:
-            return None
-        now = time.time()
-        next_ts = self._cooldown.get(uid, 0.0)
-        if now < next_ts:
-            remain = max(1, int(next_ts - now) + 1)
-            return f"冷却中，请 {remain} 秒后再试。"
+        sid = str(event.get_sender_id() or "")
+        last = self._cooldown.get(sid, 0.0)
+        remain = sec - (time.time() - last)
+        if remain > 0:
+            return f"操作过快，请 {int(remain) + 1} 秒后再试。"
         return None
 
-    def _record_cooldown(self, event: AstrMessageEvent) -> None:
+    def _mark_cooldown(self, event: AstrMessageEvent) -> None:
         if event.is_admin():
             return
-        try:
-            cd = int(self._cfg("cooldown_seconds", 8) or 0)
-        except (TypeError, ValueError):
-            cd = 8
-        if cd <= 0:
+        if self._cooldown_sec() <= 0:
             return
-        uid = str(event.get_sender_id() or "")
-        if uid:
-            self._cooldown[uid] = time.time() + cd
+        sid = str(event.get_sender_id() or "")
+        if sid:
+            self._cooldown[sid] = time.time()
 
-    def _novel_enabled(self) -> bool:
-        return bool(self._cfg("novel_enabled", True))
+    async def _refresh_attestation(self, force: bool = False) -> None:
+        now = time.time()
+        if not force and self._att_secret and (now - self._att_fetched_at) < 300:
+            return
+        async with self._att_lock:
+            now = time.time()
+            if not force and self._att_secret and (now - self._att_fetched_at) < 300:
+                return
+            client = await self._get_client()
+            try:
+                r = await client.get(
+                    "/api/app/status",
+                    headers={"User-Agent": "com.mz.game/3.62", "Accept": "application/json"},
+                )
+                data = r.json()
+            except Exception as e:
+                logger.warning(f"[mengzhai] fetch attestation failed: {e}")
+                return
+            att = (data or {}).get("attestation") or {}
+            secret = str(att.get("signSecret") or "").strip()
+            if secret:
+                self._att_secret = secret
+            self._att_pkg = str(att.get("pkg") or "com.mz.game").strip() or "com.mz.game"
+            self._att_ver = str(att.get("ver") or "1").strip() or "1"
+            self._att_fetched_at = time.time()
+            logger.info(
+                f"[mengzhai] attestation refreshed pkg={self._att_pkg} ver={self._att_ver}"
+            )
 
-    # ------------------------- 萌宅 Token -------------------------
+    def _build_app_headers(self, method: str, path: str) -> dict[str, str]:
+        """
+        与官方 libmz_guard.so mzAttestationAuth 一致:
+          message = pkg \\n sig \\n ver \\n ts \\n nonce \\n METHOD \\n path
+          auth = HMAC-SHA256(signSecret, message).hexdigest()  # 小写
+        path 不含 query。
+        """
+        if not self._att_secret:
+            return {"User-Agent": f"{self._att_pkg}/3.62", "Accept": "application/json"}
+        ts = str(int(time.time()))
+        nonce = uuid.uuid4().hex
+        method_u = (method or "GET").upper()
+        pure_path = path.split("?", 1)[0] or "/"
+        if not pure_path.startswith("/"):
+            pure_path = "/" + pure_path
+        msg = "\n".join(
+            [
+                self._att_pkg,
+                APK_CERT_SHA256,
+                self._att_ver,
+                ts,
+                nonce,
+                method_u,
+                pure_path,
+            ]
+        )
+        auth = hmac.new(
+            self._att_secret.encode("utf-8"),
+            msg.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return {
+            "X-App-Pkg": self._att_pkg,
+            "X-App-Sig": APK_CERT_SHA256,
+            "X-App-Ver": self._att_ver,
+            "X-App-Ts": ts,
+            "X-App-Nonce": nonce,
+            "X-App-Auth": auth,
+            "User-Agent": f"{self._att_pkg}/3.62",
+            "Accept": "application/json",
+        }
 
-    def _need_relogin(self) -> bool:
-        email = str(self._cfg("email", "") or "").strip()
-        password = str(self._cfg("password", "") or "")
-        if email != self._last_email or password != self._last_password:
-            return True
-        if not self._token or time.time() >= (self._token_expires_at - 60):
-            return True
-        return False
+    def _token_valid(self) -> bool:
+        if not self._token:
+            return False
+        now_ms = int(time.time() * 1000)
+        return now_ms < (self._token_expire_ms - TOKEN_REFRESH_AHEAD_SEC * 1000)
 
-    def _clear_token(self) -> None:
-        self._token = None
-        self._token_expires_at = 0.0
+    async def _ensure_token(self, force: bool = False) -> str:
+        email, password = self._email(), self._password()
+        if not email or not password:
+            raise RuntimeError("未配置萌宅账号或密码，请在 WebUI 插件配置中填写。")
 
-    async def _ensure_token(self) -> str:
-        if not self._need_relogin():
-            assert self._token is not None
+        if (
+            not force
+            and self._token_valid()
+            and email == self._last_login_email
+            and password == self._last_login_password
+        ):
             return self._token
 
-        async with self._login_lock:
-            if not self._need_relogin():
-                assert self._token is not None
+        async with self._token_lock:
+            if (
+                not force
+                and self._token_valid()
+                and email == self._last_login_email
+                and password == self._last_login_password
+            ):
                 return self._token
 
-            email = str(self._cfg("email", "") or "").strip()
-            password = str(self._cfg("password", "") or "")
-            if not email or not password:
-                raise RuntimeError(
-                    "未配置萌宅账号或密码，请在 WebUI 填写 email / password 后重载插件。"
-                )
-
+            await self._refresh_attestation()
+            client = await self._get_client()
+            headers = self._build_app_headers("POST", "/api/auth/login")
+            headers["Content-Type"] = "application/json"
             try:
-                resp = await self.client.post(
-                    f"{MZ_BASE}/api/auth/login",
+                r = await client.post(
+                    "/api/auth/login",
                     json={"email": email, "password": password},
+                    headers=headers,
                 )
             except httpx.TimeoutException as e:
-                raise RuntimeError("登录请求超时，请稍后重试。") from e
-            except httpx.RequestError as e:
-                raise RuntimeError(f"登录网络异常: {e}") from e
+                raise RuntimeError(f"登录超时: {e}") from e
+            except httpx.HTTPError as e:
+                raise RuntimeError(f"登录网络错误: {e}") from e
 
             try:
-                data = resp.json()
-            except Exception:
-                data = None
+                data = r.json()
+            except Exception as e:
+                raise RuntimeError(f"登录响应非 JSON (HTTP {r.status_code})") from e
 
-            if resp.status_code >= 400:
-                msg = ""
-                if isinstance(data, dict):
-                    msg = (
-                        data.get("message")
-                        or data.get("msg")
-                        or data.get("error")
-                        or str(data)
-                    )
-                raise RuntimeError(
-                    f"登录失败 (HTTP {resp.status_code})"
-                    + (f": {msg}" if msg else "")
-                )
+            if r.status_code >= 400 or not data.get("success"):
+                err = data.get("error") or data.get("message") or r.text[:200]
+                raise RuntimeError(f"登录失败: {err}")
 
-            if not isinstance(data, dict) or not data.get("success"):
-                msg = ""
-                if isinstance(data, dict):
-                    msg = (
-                        data.get("message")
-                        or data.get("msg")
-                        or data.get("error")
-                        or str(data)
-                    )
-                else:
-                    msg = str(data)
-                raise RuntimeError(f"登录失败: {msg or '未知错误'}")
-
-            token = data.get("token")
+            token = str(data.get("token") or "").strip()
             if not token:
-                raise RuntimeError("登录成功但未返回 token。")
-
-            self._token = str(token)
-            expires_at_ms = data.get("expiresAt")
+                raise RuntimeError("登录成功但未返回 token")
+            expires = data.get("expiresAt") or 0
             try:
-                if expires_at_ms is not None:
-                    self._token_expires_at = float(expires_at_ms) / 1000.0
-                else:
-                    self._token_expires_at = time.time() + 86400.0
-            except (TypeError, ValueError):
-                self._token_expires_at = time.time() + 86400.0
+                expires = int(expires)
+            except Exception:
+                expires = int(time.time() * 1000) + 3600 * 1000
 
-            self._last_email = email
-            self._last_password = password
-            logger.info("[萌宅] 登录成功，token 已缓存")
+            self._token = token
+            self._token_expire_ms = expires
+            self._last_login_email = email
+            self._last_login_password = password
+            logger.info("[mengzhai] login ok")
             return self._token
 
-    # ------------------------- 萌宅请求 -------------------------
-
-    async def _mz_request(
+    async def _request(
         self,
         method: str,
         path: str,
         *,
-        need_auth: bool = False,
         params: Optional[dict] = None,
-        json_body: Optional[dict] = None,
-        _retry_auth: bool = True,
+        json_body: Any = None,
+        need_auth: bool = False,
+        retry_401: bool = True,
     ) -> dict:
-        headers: dict[str, str] = {}
+        await self._refresh_attestation()
+        client = await self._get_client()
+        headers = self._build_app_headers(method, path)
+
         if need_auth:
             token = await self._ensure_token()
             headers["Authorization"] = f"Bearer {token}"
 
-        url = path if path.startswith("http") else f"{MZ_BASE}{path}"
         try:
-            resp = await self.client.request(
-                method,
-                url,
-                params=params,
-                json=json_body,
-                headers=headers or None,
+            r = await client.request(
+                method, path, params=params, json=json_body, headers=headers
             )
         except httpx.TimeoutException as e:
-            raise RuntimeError("请求超时，请稍后重试。") from e
-        except httpx.RequestError as e:
-            raise RuntimeError(f"网络请求异常: {e}") from e
+            raise RuntimeError(f"请求超时: {e}") from e
+        except httpx.HTTPError as e:
+            raise RuntimeError(f"网络错误: {e}") from e
 
-        try:
-            data = resp.json()
-        except Exception:
-            data = None
-
-        if need_auth and _retry_auth and resp.status_code == 401:
-            logger.warning("[萌宅] 收到 401，清空 token 并重试登录")
-            self._clear_token()
-            return await self._mz_request(
-                method,
-                path,
-                need_auth=True,
-                params=params,
-                json_body=json_body,
-                _retry_auth=False,
-            )
-
-        if resp.status_code >= 400:
-            self._raise_mz_error(resp.status_code, data, resp.text, need_auth=need_auth)
-
-        if not isinstance(data, dict):
-            raise RuntimeError("接口返回非 JSON 数据")
-
-        if data.get("success") is False:
-            self._raise_mz_error(resp.status_code, data, "", need_auth=need_auth)
-
-        return data
-
-    def _raise_mz_error(
-        self, status: int, data: Any, raw_text: str, *, need_auth: bool = False
-    ) -> None:
-        code = None
-        msg = ""
-        if isinstance(data, dict):
-            code = data.get("code") or data.get("error")
-            msg = (
-                data.get("message")
-                or data.get("msg")
-                or data.get("error")
-                or ""
-            )
-            if code == "DOWNLOAD_RATE_LIMITED":
-                retry = data.get("retryAfterSec")
-                extra = f"，请 {retry} 秒后再试" if retry is not None else ""
-                raise RuntimeError(f"下载限流{extra}")
-
-        if not msg:
-            msg = (raw_text or "")[:300] or "未知错误"
-
-        if status == 401:
-            if not need_auth and not self._has_credentials():
-                raise RuntimeError(
-                    "接口需要登录，但未配置账号密码。请在 WebUI 填写后重载插件。"
+        if r.status_code == 401 and need_auth and retry_401:
+            self._token = ""
+            self._token_expire_ms = 0
+            token = await self._ensure_token(force=True)
+            headers = self._build_app_headers(method, path)
+            headers["Authorization"] = f"Bearer {token}"
+            try:
+                r = await client.request(
+                    method, path, params=params, json=json_body, headers=headers
                 )
-            raise RuntimeError(f"未授权 (401)：{msg}")
+            except httpx.HTTPError as e:
+                raise RuntimeError(f"网络错误: {e}") from e
 
-        raise RuntimeError(f"接口错误 (HTTP {status}): {msg}")
-
-    def _should_auth(self) -> bool:
-        return self._has_credentials()
-
-    # ------------------------- Copy 小说请求 -------------------------
-
-    def _copy_headers(self) -> dict[str, str]:
-        ts = str(int(time.time()))
-        # 设备信息随机化不是必须；固定占位即可
-        return {
-            "Accept": "application/json",
-            "User-Agent": "COPY/3.0.9",
-            "source": "copyApp",
-            "deviceinfo": "1234567V-1234",
-            "dt": time.strftime("%Y.%m.%d"),
-            "platform": "3",
-            "referer": "com.copymanga.app-3.0.9",
-            "version": "3.0.9",
-            "device": "AB1C.123456.789",
-            "pseudoid": "abcdefghijklmnop",
-            "region": "1",
-            "authorization": "Token",
-            "umstring": "b4c89ca4104ea9a97750314d791520ac",
-            "x-auth-timestamp": ts,
-            # APP 内为 native HMAC；实测错误签名仍可访问部分接口
-            "x-auth-signature": "0",
-        }
-
-    async def _copy_get(self, path: str, params: Optional[dict] = None) -> dict:
-        last_err: Optional[Exception] = None
-        headers = self._copy_headers()
-        p = dict(params or {})
-        p.setdefault("platform", "3")
-
-        for base in COPY_BASES:
-            url = f"{base}{path}"
-            try:
-                resp = await self.client.get(url, params=p, headers=headers)
-            except httpx.TimeoutException as e:
-                last_err = RuntimeError("小说接口超时")
-                continue
-            except httpx.RequestError as e:
-                last_err = RuntimeError(f"小说接口网络异常: {e}")
-                continue
-
-            text = resp.text or ""
-            if text.lstrip().lower().startswith("<!doctype") or text.lstrip().lower().startswith(
-                "<html"
-            ):
-                last_err = RuntimeError("小说接口维护中，请稍后重试")
-                continue
-
-            try:
-                data = resp.json()
-            except Exception:
-                last_err = RuntimeError(f"小说接口非 JSON (HTTP {resp.status_code})")
-                continue
-
-            if resp.status_code >= 400:
-                msg = ""
-                if isinstance(data, dict):
-                    msg = data.get("message") or data.get("msg") or str(data)
-                last_err = RuntimeError(f"小说接口 HTTP {resp.status_code}: {msg}")
-                continue
-
-            if not isinstance(data, dict):
-                last_err = RuntimeError("小说接口返回格式错误")
-                continue
-
-            code = data.get("code")
-            if code is not None and int(code) != 200:
-                msg = data.get("message") or data.get("msg") or f"code={code}"
-                raise RuntimeError(f"小说接口失败: {msg}")
-
-            return data
-
-        raise last_err or RuntimeError("小说接口全部节点不可用")
-
-    # ------------------------- 通用工具 -------------------------
-
-    def _is_valid_uuid(self, s: str) -> bool:
-        return bool(s and UUID_RE.match(s.strip()))
-
-    def _is_valid_path_word(self, s: str) -> bool:
-        return bool(s and PATH_WORD_RE.match(s.strip()))
-
-    def _list_limit(self) -> int:
         try:
-            n = int(self._cfg("list_limit", 10) or 10)
-        except (TypeError, ValueError):
-            n = 10
-        return max(1, min(n, 50))
+            data = r.json()
+        except Exception as e:
+            raise RuntimeError(f"响应非 JSON (HTTP {r.status_code}): {r.text[:200]}") from e
 
-    def _extract_arg(self, event: AstrMessageEvent, arg: str, prefixes: tuple[str, ...]) -> str:
-        text = (arg or "").strip()
-        if text:
-            return text
-        msg = (event.message_str or "").strip()
-        msg = re.sub(r"^\s*/?\s*", "", msg)
-        for p in prefixes:
-            if msg.lower().startswith(p.lower()):
-                msg = msg[len(p) :].strip()
-                break
-        return re.sub(r"^/\s*", "", msg).strip()
+        if r.status_code == 401:
+            err = data.get("error") or "未授权，请检查账号密码"
+            raise RuntimeError(f"未授权 (HTTP 401): {err}")
 
-    def _extract_items(self, data: dict) -> list:
-        if not isinstance(data, dict):
-            return []
-        candidates = [
-            data.get("items"),
-            data.get("list"),
-            data.get("data"),
-            data.get("results"),
-            data.get("softwares"),
-        ]
-        items = None
-        for c in candidates:
-            if isinstance(c, list):
-                items = c
+        if r.status_code == 403:
+            err = data.get("error") or data.get("code") or r.text[:200]
+            code = data.get("code") or ""
+            if code == "APP_ATTESTATION_FAILED":
+                self._att_secret = ""
+                self._att_fetched_at = 0
+                raise RuntimeError(f"应用完整性校验失败，请稍后重试: {err}")
+            raise RuntimeError(f"拒绝访问 (HTTP 403): {err}")
+
+        if isinstance(data, dict) and data.get("success") is False:
+            err = data.get("error") or data.get("message") or str(data)
+            code = data.get("code") or ""
+            if code == "DOWNLOAD_RATE_LIMITED":
+                retry = data.get("retryAfterSec") or data.get("retryAfter") or "?"
+                raise RuntimeError(f"下载限流，请约 {retry} 秒后再试。")
+            raise RuntimeError(f"接口错误 (HTTP {r.status_code}): {err}")
+
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}: {data}")
+
+        return data if isinstance(data, dict) else {"success": True, "data": data}
+
+    @staticmethod
+    def _extract_items(data: dict) -> list[dict]:
+        candidates: list = []
+        for key in ("items", "list", "data", "results", "records"):
+            v = data.get(key)
+            if isinstance(v, list):
+                candidates = v
                 break
-            if isinstance(c, dict):
-                for k in ("items", "list", "results", "records"):
-                    if isinstance(c.get(k), list):
-                        items = c.get(k)
+            if isinstance(v, dict):
+                for k2 in ("items", "list", "records"):
+                    if isinstance(v.get(k2), list):
+                        candidates = v[k2]
                         break
-            if items is not None:
-                break
-        if not isinstance(items, list):
-            return []
+        if not candidates and isinstance(data.get("item"), dict):
+            candidates = [data["item"]]
 
-        seen: set[str] = set()
-        unique: list = []
-        for it in items:
+        seen = set()
+        out: list[dict] = []
+        for it in candidates:
             if not isinstance(it, dict):
                 continue
-            sid = str(it.get("id") or it.get("path_word") or "").strip()
+            sid = str(it.get("id") or "").strip()
+            if sid and sid in seen:
+                continue
             if sid:
-                if sid in seen:
-                    continue
                 seen.add(sid)
-            unique.append(it)
-        return unique
+            out.append(it)
+        return out
 
-    def _match_score(self, item: dict, keyword: str) -> int:
-        if not isinstance(item, dict) or not keyword:
-            return 0
-        kw = keyword.strip().lower()
+    @staticmethod
+    def _match_score(item: dict, keyword: str) -> int:
+        kw = (keyword or "").strip().lower()
         if not kw:
             return 0
-
-        def contains(text: Any) -> bool:
-            if text is None:
-                return False
-            if isinstance(text, (list, tuple, set)):
-                return any(contains(x) for x in text)
-            return kw in str(text).lower()
-
-        title = item.get("title") or item.get("name") or ""
-        if contains(title):
+        title = str(item.get("title") or item.get("name") or "").lower()
+        if kw in title:
             return 3
-        tags = (
-            item.get("tags")
-            or item.get("tag")
-            or item.get("labels")
-            or item.get("theme")
-            or item.get("categories")
-            or []
-        )
-        if contains(tags):
+        tags = item.get("tags") or []
+        if isinstance(tags, list):
+            tag_str = " ".join(str(t) for t in tags).lower()
+        else:
+            tag_str = str(tags).lower()
+        if kw in tag_str:
             return 2
-        desc = (
+        desc = str(
             item.get("description")
             or item.get("desc")
             or item.get("summary")
-            or item.get("brief")
+            or item.get("intro")
             or ""
-        )
-        if contains(desc):
+        ).lower()
+        if kw in desc:
             return 1
         return 0
 
-    def _sort_search_items(self, items: list, keyword: str) -> list:
-        indexed = list(enumerate(items))
-        indexed.sort(
-            key=lambda pair: (
-                -self._match_score(pair[1] if isinstance(pair[1], dict) else {}, keyword),
-                pair[0],
-            )
+    def _sort_search_items(self, items: list[dict], keyword: str) -> list[dict]:
+        return sorted(
+            items,
+            key=lambda it: (-self._match_score(it, keyword), str(it.get("title") or "")),
         )
-        return [it for _, it in indexed]
 
-    def _format_software_list(self, items: Any, title: str, keyword: str = "") -> str:
-        if not isinstance(items, list):
-            items = []
-        items = items[: self._list_limit()]
+    def _format_list(self, items: list[dict], title: str, keyword: str = "") -> str:
+        limit = self._list_limit()
+        items = items[:limit]
         if not items:
-            return f"【{title}】\n暂无数据"
-
-        lines = [f"【{title}】共 {len(items)} 条", ""]
+            return "【" + title + "】\n暂无结果。"
+        lines = ["【" + title + "】共 " + str(len(items)) + " 条（最多显示 " + str(limit) + "）\n"]
         for i, it in enumerate(items, 1):
-            if not isinstance(it, dict):
-                lines.append(f"{i}. （无效条目）")
-                lines.append("")
-                continue
-            sid = it.get("id") or "未知ID"
-            name = it.get("title") or it.get("name") or "未知标题"
-            size = (
-                it.get("packageSize")
-                or it.get("fileSize")
-                or it.get("size")
-                or "未知大小"
-            )
-            mark = ""
-            if keyword:
-                score = self._match_score(it, keyword)
-                if score == 3:
-                    mark = " 【标题匹配】"
-                elif score == 2:
-                    mark = " 【标签匹配】"
-                elif score == 1:
-                    mark = " 【简介匹配】"
-            lines.append(f"{i}. {name}{mark}")
-            lines.append(f"   ID：{sid}")
-            lines.append(f"   大小：{size}")
-            lines.append("")
-        lines.append("使用 /mz下载 <软件ID> 获取下载链接")
-        return "\n".join(lines).rstrip()
-
-    def _format_novel_list(self, items: list, title: str) -> str:
-        items = items[: self._list_limit()]
-        if not items:
-            return f"【{title}】\n暂无数据"
-
-        lines = [f"【{title}】共 {len(items)} 条", ""]
-        for i, it in enumerate(items, 1):
-            name = it.get("name") or "未知"
-            pw = it.get("path_word") or ""
-            authors = it.get("author") or []
-            if isinstance(authors, list):
-                author = " / ".join(
-                    a.get("name") for a in authors if isinstance(a, dict) and a.get("name")
-                ) or "未知"
-            else:
-                author = str(authors)
-            popular = it.get("popular", "")
-            lines.append(f"{i}. {name}")
-            lines.append(f"   作者：{author}")
-            lines.append(f"   path_word：{pw}")
-            if popular != "":
-                lines.append(f"   热度：{popular}")
-            lines.append("")
-        lines.append("使用 /mz小说详情 <path_word> 查看详情")
-        lines.append("使用 /mz小说分卷 <path_word> 查看分卷")
-        return "\n".join(lines).rstrip()
-
-    def _format_download(
-        self,
-        *,
-        software_id: str,
-        url: str,
-        file_name: str,
-        file_size: str,
-        is_member: Any,
-    ) -> str:
-        lines = [
-            "【萌宅 · 下载准备成功】",
-            "────────────────",
-            f"软件 ID：{software_id}",
-            f"文件名：{file_name}",
-            f"大小：{file_size}",
-        ]
-        if is_member is not None:
-            lines.append(f"会员资源：{'是' if is_member else '否'}")
-        lines.append("────────────────")
-        lines.append("下载链接：")
-        lines.append(url)
-        lines.append("────────────────")
-        lines.append("提示：链接可能有有效期，请尽快下载。")
+            name = str(it.get("title") or it.get("name") or "未知").strip()
+            sid = str(it.get("id") or "").strip()
+            size = str(
+                it.get("packageSize") or it.get("fileSize") or it.get("size") or ""
+            ).strip()
+            score = self._match_score(it, keyword) if keyword else 0
+            mark = {3: "〔标题〕", 2: "〔标签〕", 1: "〔简介〕"}.get(score, "")
+            line = f"{i}. {name}{mark}"
+            if size:
+                line += f"\n   大小: {size}"
+            if sid:
+                line += f"\n   ID: {sid}"
+            lines.append(line)
+        lines.append("\n下载: /mz下载 <软件ID>\n详情: /mz详情 <软件ID>")
         return "\n".join(lines)
 
-    def _extract_download_info(self, data: dict) -> tuple[str, str, str, Any]:
-        nested = data.get("data") if isinstance(data.get("data"), dict) else {}
-        sources = [data, nested]
+    @staticmethod
+    def _format_detail(item: dict) -> str:
+        name = str(item.get("title") or item.get("name") or "未知").strip()
+        sid = str(item.get("id") or "").strip()
+        size = str(
+            item.get("packageSize") or item.get("fileSize") or item.get("size") or "-"
+        ).strip()
+        cat = str(item.get("categoryName") or item.get("category") or "-").strip()
+        tags = item.get("tags") or []
+        if isinstance(tags, list):
+            tag_s = "、".join(str(t) for t in tags) if tags else "-"
+        else:
+            tag_s = str(tags) or "-"
+        desc = str(
+            item.get("description")
+            or item.get("desc")
+            or item.get("summary")
+            or item.get("intro")
+            or ""
+        ).strip()
+        if len(desc) > 300:
+            desc = desc[:300] + "…"
+        lines = [
+            "【萌宅 · 详情】",
+            f"名称: {name}",
+            f"ID: {sid}",
+            f"分类: {cat}",
+            f"大小: {size}",
+            f"标签: {tag_s}",
+        ]
+        if desc:
+            lines.append(f"简介: {desc}")
+        if sid:
+            lines.append(f"\n下载: /mz下载 {sid}")
+        return "\n".join(lines)
 
-        def pick(*keys: str) -> Any:
-            for src in sources:
-                for k in keys:
-                    v = src.get(k)
-                    if v is not None and v != "":
-                        return v
-            return None
+    @staticmethod
+    def _format_download(data: dict, software_id: str) -> str:
+        url = (
+            data.get("downloadUrl")
+            or data.get("directUrl")
+            or data.get("url")
+            or ""
+        )
+        if isinstance(url, dict):
+            url = url.get("url") or url.get("downloadUrl") or ""
+        url = str(url).strip()
+        name = str(data.get("fileName") or data.get("title") or software_id).strip()
+        size = str(
+            data.get("fileSize") or data.get("packageSize") or data.get("size") or "-"
+        ).strip()
+        is_member = data.get("isMember")
+        lines = [
+            "╔══════════════════",
+            "║ 萌宅 · 下载链接",
+            "╠══════════════════",
+            f"║ 文件: {name}",
+            f"║ 大小: {size}",
+            f"║ ID: {software_id}",
+        ]
+        if is_member is not None:
+            lines.append(f"║ 会员: {'是' if is_member else '否'}")
+        lines.append("╠══════════════════")
+        if url:
+            lines.append("║ 链接:")
+            lines.append(f"║ {url}")
+        else:
+            lines.append("║ （未返回下载地址，请稍后重试或检查会员权限）")
+            for k in ("message", "tip", "hint"):
+                if data.get(k):
+                    lines.append(f"║ {data.get(k)}")
+        lines.append("╚══════════════════")
+        return "\n".join(lines)
 
-        url = pick("downloadUrl", "directUrl", "url", "link")
-        file_name = pick("fileName", "filename", "name") or "未知文件名"
-        file_size = pick("fileSize", "size", "packageSize") or "未知"
-        is_member = pick("isMember", "member")
-        return str(url) if url else "", str(file_name), str(file_size), is_member
+    async def _build_result(
+        self, event: AstrMessageEvent, text: str
+    ) -> AsyncGenerator:
+        if self._send_as_forward():
+            try:
+                node = Node(
+                    uin=str(event.get_self_id() or "0"),
+                    name="萌宅下载",
+                    content=[Plain(text)],
+                )
+                yield event.chain_result([node])
+                return
+            except Exception as e:
+                logger.warning(f"[mengzhai] forward failed, fallback plain: {e}")
+        yield event.plain_result(text)
 
-    def _build_result(self, event: AstrMessageEvent, text: str):
-        if not self._cfg("send_as_forward", False):
-            return event.plain_result(text)
-        try:
-            self_id = event.get_self_id()
-            uin: Any = str(self_id) if self_id is not None else "0"
-            node = Node(uin=uin, name="萌宅插件", content=[Plain(text)])
-            return event.chain_result([node])
-        except Exception as e:
-            logger.warning(f"[萌宅] 合并转发失败，回退纯文本: {e}")
-            return event.plain_result(text)
-
-    # ------------------------- 软件指令 -------------------------
+    def _extract_keyword(self, event: AstrMessageEvent, keyword: str = "") -> str:
+        kw = (keyword or "").strip()
+        if kw:
+            return kw
+        msg = (event.message_str or "").strip()
+        for prefix in ("mz搜索", "mzsearch", "MZ搜索", "/mz搜索", "/mzsearch"):
+            if msg.lower().startswith(prefix.lower()):
+                msg = msg[len(prefix) :].strip()
+                break
+        msg = re.sub(r"^/\s*", "", msg).strip()
+        for prefix in ("mz搜索", "mzsearch"):
+            if msg.lower().startswith(prefix.lower()):
+                msg = msg[len(prefix) :].strip()
+        return msg
 
     @filter.command("mz搜索")
     async def cmd_search(self, event: AstrMessageEvent, keyword: str = ""):
-        """搜索软件：/mz搜索 <关键词>"""
-        if msg := self._check_admin_only(event):
-            yield event.plain_result(msg)
+        if err := self._check_admin(event):
+            yield event.plain_result(err)
             return
-        if msg := self._check_cooldown(event):
-            yield event.plain_result(msg)
+        if err := self._check_cooldown(event):
+            yield event.plain_result(err)
             return
 
-        keyword = self._extract_arg(event, keyword, ("mz搜索", "mzsearch"))
-        if not keyword:
-            yield event.plain_result("请输入关键词，例如：/mz搜索 爱情")
+        kw = self._extract_keyword(event, keyword)
+        if not kw:
+            yield event.plain_result("用法: /mz搜索 <关键词>")
             return
 
         try:
-            data = await self._mz_request(
+            if not self._has_credentials():
+                yield event.plain_result("搜索需要登录，请先在 WebUI 填写萌宅账号和密码。")
+                return
+            data = await self._request(
                 "GET",
                 "/api/software",
-                params={
-                    "keyword": keyword,
-                    "q": keyword,
-                    "search": keyword,
-                    "query": keyword,
-                },
-                need_auth=self._should_auth(),
+                params={"keyword": kw},
+                need_auth=True,
             )
             items = self._extract_items(data)
-            items = self._sort_search_items(items, keyword)
-            text = self._format_software_list(items, f"搜索「{keyword}」", keyword)
-            self._record_cooldown(event)
-            yield self._build_result(event, text)
+            items = self._sort_search_items(items, kw)
+            text = self._format_list(items, f"搜索「{kw}」", keyword=kw)
+            self._mark_cooldown(event)
+            async for r in self._build_result(event, text):
+                yield r
         except Exception as e:
-            logger.exception("[萌宅] 搜索失败")
-            yield event.plain_result(f"搜索失败：{e}")
+            logger.exception("[mengzhai] search error")
+            yield event.plain_result(f"搜索失败: {e}")
 
     @filter.command("mz最新")
     async def cmd_latest(self, event: AstrMessageEvent):
-        """最新软件：/mz最新"""
-        if msg := self._check_admin_only(event):
-            yield event.plain_result(msg)
+        if err := self._check_admin(event):
+            yield event.plain_result(err)
             return
-        if msg := self._check_cooldown(event):
-            yield event.plain_result(msg)
+        if err := self._check_cooldown(event):
+            yield event.plain_result(err)
             return
         try:
-            data = await self._mz_request(
-                "GET",
-                "/api/software/home/latest",
-                need_auth=self._should_auth(),
-            )
-            text = self._format_software_list(self._extract_items(data), "最新软件")
-            self._record_cooldown(event)
-            yield self._build_result(event, text)
+            data = await self._request("GET", "/api/software/home/latest", need_auth=False)
+            items = self._extract_items(data)
+            text = self._format_list(items, "最新软件")
+            self._mark_cooldown(event)
+            async for r in self._build_result(event, text):
+                yield r
         except Exception as e:
-            logger.exception("[萌宅] 最新列表失败")
-            yield event.plain_result(f"获取最新列表失败：{e}")
+            logger.exception("[mengzhai] latest error")
+            yield event.plain_result(f"获取最新失败: {e}")
 
     @filter.command("mz热门")
     async def cmd_hot(self, event: AstrMessageEvent):
-        """热门软件：/mz热门"""
-        if msg := self._check_admin_only(event):
-            yield event.plain_result(msg)
+        if err := self._check_admin(event):
+            yield event.plain_result(err)
             return
-        if msg := self._check_cooldown(event):
-            yield event.plain_result(msg)
+        if err := self._check_cooldown(event):
+            yield event.plain_result(err)
             return
         try:
-            data = await self._mz_request(
-                "GET",
-                "/api/software/home/most-liked",
-                need_auth=self._should_auth(),
+            data = await self._request(
+                "GET", "/api/software/home/most-liked", need_auth=False
             )
-            text = self._format_software_list(self._extract_items(data), "热门软件")
-            self._record_cooldown(event)
-            yield self._build_result(event, text)
+            items = self._extract_items(data)
+            text = self._format_list(items, "热门软件")
+            self._mark_cooldown(event)
+            async for r in self._build_result(event, text):
+                yield r
         except Exception as e:
-            logger.exception("[萌宅] 热门列表失败")
-            yield event.plain_result(f"获取热门列表失败：{e}")
+            logger.exception("[mengzhai] hot error")
+            yield event.plain_result(f"获取热门失败: {e}")
 
     @filter.command("mz详情")
     async def cmd_detail(self, event: AstrMessageEvent, software_id: str = ""):
-        """软件详情：/mz详情 <UUID>"""
-        if msg := self._check_admin_only(event):
-            yield event.plain_result(msg)
+        if err := self._check_admin(event):
+            yield event.plain_result(err)
             return
-        if msg := self._check_cooldown(event):
-            yield event.plain_result(msg)
+        if err := self._check_cooldown(event):
+            yield event.plain_result(err)
             return
 
-        software_id = self._extract_arg(event, software_id, ("mz详情",))
-        if not self._is_valid_uuid(software_id):
-            yield event.plain_result("请提供有效软件 UUID")
+        sid = (software_id or "").strip()
+        if not sid:
+            msg = (event.message_str or "").strip()
+            for p in ("mz详情", "/mz详情", "mzdetail"):
+                if msg.lower().startswith(p.lower()):
+                    sid = msg[len(p) :].strip()
+                    break
+        if not sid or not UUID_RE.match(sid):
+            yield event.plain_result("用法: /mz详情 <软件UUID>")
             return
 
         try:
-            data = await self._mz_request(
-                "GET",
-                f"/api/software/{software_id}",
-                need_auth=self._should_auth(),
-            )
+            data = await self._request("GET", f"/api/software/{sid}", need_auth=False)
             item = data.get("item") if isinstance(data.get("item"), dict) else data
-            if not isinstance(item, dict):
-                item = {}
-            title = item.get("title") or item.get("name") or "未知"
-            size = (
-                item.get("packageSize")
-                or item.get("fileSize")
-                or item.get("size")
-                or "未知"
-            )
-            desc = (
-                item.get("description")
-                or item.get("desc")
-                or item.get("summary")
-                or "无描述"
-            )
-            if isinstance(desc, str) and len(desc) > 500:
-                desc = desc[:500] + "..."
-            text = (
-                f"【软件详情】\n"
-                f"标题：{title}\n"
-                f"ID：{software_id}\n"
-                f"大小：{size}\n"
-                f"描述：{desc}\n\n"
-                f"使用 /mz下载 {software_id} 获取下载链接"
-            )
-            self._record_cooldown(event)
-            yield self._build_result(event, text)
+            if not isinstance(item, dict) or not item:
+                items = self._extract_items(data)
+                item = items[0] if items else {}
+            if not item:
+                yield event.plain_result("未找到该软件。")
+                return
+            text = self._format_detail(item)
+            self._mark_cooldown(event)
+            async for r in self._build_result(event, text):
+                yield r
         except Exception as e:
-            logger.exception("[萌宅] 详情失败")
-            yield event.plain_result(f"获取详情失败：{e}")
+            logger.exception("[mengzhai] detail error")
+            yield event.plain_result(f"获取详情失败: {e}")
 
     @filter.command("mz下载")
     async def cmd_download(self, event: AstrMessageEvent, software_id: str = ""):
-        """软件下载：/mz下载 <UUID>"""
-        if msg := self._check_admin_only(event):
-            yield event.plain_result(msg)
+        if err := self._check_admin(event):
+            yield event.plain_result(err)
             return
-        if msg := self._check_cooldown(event):
-            yield event.plain_result(msg)
+        if err := self._check_cooldown(event):
+            yield event.plain_result(err)
             return
 
-        software_id = self._extract_arg(event, software_id, ("mz下载",))
-        if not self._is_valid_uuid(software_id):
-            yield event.plain_result("请提供有效软件 UUID")
+        if not self._has_credentials():
+            yield event.plain_result("下载需要登录，请先在 WebUI 填写萌宅账号和密码。")
+            return
+
+        sid = (software_id or "").strip()
+        if not sid:
+            msg = (event.message_str or "").strip()
+            for p in ("mz下载", "/mz下载", "mzdownload"):
+                if msg.lower().startswith(p.lower()):
+                    sid = msg[len(p) :].strip()
+                    break
+        if not sid or not UUID_RE.match(sid):
+            yield event.plain_result("用法: /mz下载 <软件UUID>")
             return
 
         try:
-            data = await self._mz_request(
+            data = await self._request(
                 "POST",
-                f"/api/software/{software_id}/download",
-                need_auth=True,
+                f"/api/software/{sid}/download",
                 json_body={},
+                need_auth=True,
             )
-            url, file_name, file_size, is_member = self._extract_download_info(data)
-            if not url:
-                yield event.plain_result(
-                    f"未获取到下载链接。\n摘要：{str(data)[:300]}"
-                )
-                return
-            text = self._format_download(
-                software_id=software_id,
-                url=url,
-                file_name=file_name,
-                file_size=file_size,
-                is_member=is_member,
-            )
-            self._record_cooldown(event)
-            yield self._build_result(event, text)
+            payload = data
+            for key in ("data", "item", "result"):
+                if isinstance(data.get(key), dict):
+                    payload = {**data, **data[key]}
+                    break
+            text = self._format_download(payload, sid)
+            self._mark_cooldown(event)
+            async for r in self._build_result(event, text):
+                yield r
         except Exception as e:
-            logger.exception("[萌宅] 下载失败")
-            yield event.plain_result(f"获取下载链接失败：{e}")
-
-    # ------------------------- 小说指令 -------------------------
-
-    @filter.command("mz小说搜索")
-    async def cmd_novel_search(self, event: AstrMessageEvent, keyword: str = ""):
-        """搜索小说：/mz小说搜索 <关键词>"""
-        if msg := self._check_admin_only(event):
-            yield event.plain_result(msg)
-            return
-        if not self._novel_enabled():
-            yield event.plain_result("小说功能已关闭（WebUI 中 novel_enabled）。")
-            return
-        if msg := self._check_cooldown(event):
-            yield event.plain_result(msg)
-            return
-
-        keyword = self._extract_arg(event, keyword, ("mz小说搜索",))
-        if not keyword:
-            yield event.plain_result("请输入关键词，例如：/mz小说搜索 爱情")
-            return
-
-        try:
-            limit = self._list_limit()
-            data = await self._copy_get(
-                "/api/v3/search/books",
-                {"q": keyword, "limit": str(limit), "offset": "0"},
-            )
-            results = data.get("results") if isinstance(data.get("results"), dict) else {}
-            items = results.get("list") if isinstance(results, dict) else []
-            if not isinstance(items, list):
-                items = []
-            items = self._sort_search_items(items, keyword)
-            total = results.get("total", len(items)) if isinstance(results, dict) else len(items)
-            text = self._format_novel_list(items, f"小说搜索「{keyword}」· 约 {total} 条")
-            self._record_cooldown(event)
-            yield self._build_result(event, text)
-        except Exception as e:
-            logger.exception("[萌宅] 小说搜索失败")
-            yield event.plain_result(f"小说搜索失败：{e}")
-
-    @filter.command("mz小说详情")
-    async def cmd_novel_detail(self, event: AstrMessageEvent, path_word: str = ""):
-        """小说详情：/mz小说详情 <path_word>"""
-        if msg := self._check_admin_only(event):
-            yield event.plain_result(msg)
-            return
-        if not self._novel_enabled():
-            yield event.plain_result("小说功能已关闭（WebUI 中 novel_enabled）。")
-            return
-        if msg := self._check_cooldown(event):
-            yield event.plain_result(msg)
-            return
-
-        path_word = self._extract_arg(event, path_word, ("mz小说详情",))
-        if not self._is_valid_path_word(path_word):
-            yield event.plain_result(
-                "请提供 path_word，例如：/mz小说详情 yuziaiqinggushi"
-            )
-            return
-
-        try:
-            data = await self._copy_get(f"/api/v3/book/{path_word}", {})
-            results = data.get("results") if isinstance(data.get("results"), dict) else {}
-            book = results.get("book") if isinstance(results, dict) else {}
-            if not isinstance(book, dict):
-                book = {}
-
-            name = book.get("name") or "未知"
-            brief = book.get("brief") or "无简介"
-            if isinstance(brief, str) and len(brief) > 400:
-                brief = brief[:400] + "..."
-            authors = book.get("author") or []
-            if isinstance(authors, list):
-                author = " / ".join(
-                    a.get("name") for a in authors if isinstance(a, dict) and a.get("name")
-                ) or "未知"
-            else:
-                author = "未知"
-            themes = book.get("theme") or []
-            if isinstance(themes, list):
-                theme = " / ".join(
-                    t.get("name") for t in themes if isinstance(t, dict) and t.get("name")
-                ) or "无"
-            else:
-                theme = "无"
-            status = book.get("status")
-            if isinstance(status, dict):
-                status = status.get("display") or status.get("value") or "未知"
-            last = book.get("last_chapter") or {}
-            last_name = last.get("name") if isinstance(last, dict) else ""
-            popular = book.get("popular", results.get("popular", ""))
-
-            text = (
-                f"【小说详情】\n"
-                f"书名：{name}\n"
-                f"path_word：{path_word}\n"
-                f"作者：{author}\n"
-                f"主题：{theme}\n"
-                f"状态：{status}\n"
-                f"热度：{popular}\n"
-                f"最新：{last_name or '无'}\n"
-                f"简介：{brief}\n\n"
-                f"使用 /mz小说分卷 {path_word} 查看分卷与文本地址"
-            )
-            self._record_cooldown(event)
-            yield self._build_result(event, text)
-        except Exception as e:
-            logger.exception("[萌宅] 小说详情失败")
-            yield event.plain_result(f"小说详情失败：{e}")
-
-    @filter.command("mz小说分卷")
-    async def cmd_novel_volumes(self, event: AstrMessageEvent, path_word: str = ""):
-        """小说分卷：/mz小说分卷 <path_word>"""
-        if msg := self._check_admin_only(event):
-            yield event.plain_result(msg)
-            return
-        if not self._novel_enabled():
-            yield event.plain_result("小说功能已关闭（WebUI 中 novel_enabled）。")
-            return
-        if msg := self._check_cooldown(event):
-            yield event.plain_result(msg)
-            return
-
-        path_word = self._extract_arg(event, path_word, ("mz小说分卷",))
-        if not self._is_valid_path_word(path_word):
-            yield event.plain_result(
-                "请提供 path_word，例如：/mz小说分卷 yuziaiqinggushi"
-            )
-            return
-
-        try:
-            data = await self._copy_get(f"/api/v3/book/{path_word}/volumes", {})
-            results = data.get("results") if isinstance(data.get("results"), dict) else {}
-            vols = results.get("list") if isinstance(results, dict) else []
-            if not isinstance(vols, list) or not vols:
-                yield event.plain_result("暂无分卷数据")
-                return
-
-            lines = [f"【小说分卷】{path_word}", f"共 {len(vols)} 卷", ""]
-            # 最多展示 15 卷，避免刷屏；并为前 3 卷尝试取 txt 链接
-            show = vols[:15]
-            for i, v in enumerate(show, 1):
-                if not isinstance(v, dict):
-                    continue
-                vid = v.get("id") or ""
-                vname = v.get("name") or f"第{i}卷"
-                lines.append(f"{i}. {vname}")
-                lines.append(f"   volume_id：{vid}")
-
-            # 尝试给第一卷补 txt 直链
-            first = show[0] if isinstance(show[0], dict) else {}
-            first_id = str(first.get("id") or "")
-            if first_id:
-                try:
-                    vol_data = await self._copy_get(
-                        f"/api/v3/book/{path_word}/volume/{first_id}",
-                        {"in_mainland": "true"},
-                    )
-                    vr = vol_data.get("results") if isinstance(vol_data.get("results"), dict) else {}
-                    volume = vr.get("volume") if isinstance(vr, dict) else {}
-                    if isinstance(volume, dict):
-                        txt = volume.get("txt_addr") or ""
-                        enc = volume.get("txt_encoding") or ""
-                        if txt:
-                            lines.append("")
-                            lines.append(f"第1卷文本：{txt}")
-                            if enc:
-                                lines.append(f"编码：{enc}")
-                except Exception as e:
-                    logger.warning(f"[萌宅] 获取分卷文本失败: {e}")
-
-            lines.append("")
-            lines.append("提示：文本来自第三方源，请遵守版权与当地法律，仅供个人学习。")
-            text = "\n".join(lines)
-            self._record_cooldown(event)
-            yield self._build_result(event, text)
-        except Exception as e:
-            logger.exception("[萌宅] 小说分卷失败")
-            yield event.plain_result(f"小说分卷失败：{e}")
-
-    @filter.command("mz小说主题")
-    async def cmd_novel_themes(self, event: AstrMessageEvent):
-        """小说主题：/mz小说主题"""
-        if msg := self._check_admin_only(event):
-            yield event.plain_result(msg)
-            return
-        if not self._novel_enabled():
-            yield event.plain_result("小说功能已关闭（WebUI 中 novel_enabled）。")
-            return
-        if msg := self._check_cooldown(event):
-            yield event.plain_result(msg)
-            return
-
-        try:
-            data = await self._copy_get("/api/v3/theme/book/count", {})
-            results = data.get("results") if isinstance(data.get("results"), dict) else {}
-            items = results.get("list") if isinstance(results, dict) else []
-            if not isinstance(items, list):
-                items = []
-            items = items[: self._list_limit()]
-            if not items:
-                yield event.plain_result("暂无主题数据")
-                return
-            lines = ["【小说主题】", ""]
-            for i, it in enumerate(items, 1):
-                if not isinstance(it, dict):
-                    continue
-                lines.append(
-                    f"{i}. {it.get('name', '未知')}（{it.get('path_word', '')}）· {it.get('count', 0)}"
-                )
-            lines.append("")
-            lines.append("可用 /mz小说搜索 <主题名或关键词> 搜索")
-            text = "\n".join(lines)
-            self._record_cooldown(event)
-            yield self._build_result(event, text)
-        except Exception as e:
-            logger.exception("[萌宅] 小说主题失败")
-            yield event.plain_result(f"小说主题失败：{e}")
+            logger.exception("[mengzhai] download error")
+            yield event.plain_result(f"获取下载链接失败: {e}")
